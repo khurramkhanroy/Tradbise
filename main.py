@@ -7,6 +7,10 @@ import threading
 import pytz
 import requests
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 # ==================== CONFIGURATION ====================
 TELEGRAM_TOKEN = os.environ.get(
@@ -32,102 +36,108 @@ def send_telegram_alert(message):
     print(f"Telegram error: {e}")
 
 
-def check_daily_good_morning():
-  global last_morning_msg_date
-  pkt = pytz.timezone("Asia/Karachi")
-  now_pkt = datetime.datetime.now(pkt)
-
-  if now_pkt.hour == 8 and now_pkt.minute < 5:
-    today_str = now_pkt.strftime("%Y-%m-%d")
-    if last_morning_msg_date != today_str:
-      morning_msg = (
-          "☀️ *Good Morning Boss!*\n\nTradebise Direct Monitor Active 24/7! 🚀📈"
-      )
-      send_telegram_alert(morning_msg)
-      last_morning_msg_date = today_str
+def get_headless_driver():
+  options = Options()
+  options.add_argument("--headless")
+  options.add_argument("--no-sandbox")
+  options.add_argument("--disable-dev-shm-usage")
+  options.add_argument("--disable-gpu")
+  options.add_argument(
+      "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+  )
+  service = Service(ChromeDriverManager().install())
+  return webdriver.Chrome(service=service, options=options)
 
 
-def fetch_and_parse_signal(pair_name, url):
+def fetch_and_parse_signal():
   global last_signal_text
-  headers = {
-      "User-Agent": (
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-      )
-  }
-
   pkt = pytz.timezone("Asia/Karachi")
   current_time = datetime.datetime.now(pkt).strftime("%I:%M %p")
 
+  driver = None
   try:
-    res = requests.get(url, headers=headers, timeout=15)
-    if res.status_code != 200:
-      return
+    driver = get_headless_driver()
 
-    soup = BeautifulSoup(res.text, "html.parser")
+    for pair_name, url in PAIRS_URLS.items():
+      try:
+        print(f"[{current_time}] Opening {pair_name} page...")
+        driver.get(url)
 
-    # Garbage / Loading texts ko filter karna
-    text_content = soup.get_text(separator="\n", strip=True)
-    lines = [line.strip() for line in text_content.split("\n") if line.strip()]
+        # 1.5 Minute (90 Seconds) mandatory wait for chart & signal generation
+        print(
+            f"Waiting 90 seconds for {pair_name} chart auto-load and AI"
+            " analysis..."
+        )
+        time.sleep(90)
 
-    # Strict filtering: Agar content "Search market" ya lazy-loading header ho toh ignore karein
-    filtered_lines = [
-        line
-        for line in lines
-        if line.lower()
-        not in [
-            "search market",
-            "tradebise",
-            "signals",
-            "home",
-            "watchlist",
-            "menu",
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        full_text = soup.get_text(separator="\n", strip=True)
+
+        lines = [
+            line.strip() for line in full_text.split("\n") if line.strip()
         ]
-    ]
 
-    # Check if BUY or SELL is strictly present in page content
-    full_text = " ".join(filtered_lines).upper()
-    if "BUY" not in full_text and "SELL" not in full_text:
-      print(
-          f"[{pair_name}] No active BUY/SELL signal found (Page still loading"
-          " or Neutral)."
-      )
-      return
+        # Filter out static layout junk
+        ignore_keywords = [
+            "sign up free",
+            "unlock 30 days",
+            "log in",
+            "user",
+            "free",
+            "extreme volatility",
+            "prediction meets perfection",
+            "search market",
+        ]
+        clean_lines = [
+            line
+            for line in lines
+            if not any(ign in line.lower() for ign in ignore_keywords)
+        ]
 
-    extracted_payload = "\n".join(filtered_lines[:12])
+        # Verification check: Actual signal metrics must be present
+        analysis_content = "\n".join(clean_lines)
+        if not any(
+            key in analysis_content.upper()
+            for key in ["ENTRY", "TARGET", "STOP LOSS", "TP", "BUY", "SELL"]
+        ):
+          print(
+              f"[{pair_name}] Signal output not fully ready yet. Skipping noise."
+          )
+          continue
 
-    if extracted_payload and extracted_payload != last_signal_text[pair_name]:
-      msg = (
-          "🚨 *TRADEBISE SIGNAL DETECTED* 🚨\n\n"
-          f"📌 *Asset:* `{pair_name}`\n"
-          f"⏰ *Time:* `{current_time} PKT`\n\n"
-          "📊 *Signal Details:*\n"
-          "-----------------------------------\n"
-          f"{extracted_payload}\n"
-          "-----------------------------------\n\n"
-          f"🔗 [Open Direct Dashboard]({url})"
-      )
+        formatted_signal = "\n".join(clean_lines[:12])
 
-      send_telegram_alert(msg)
-      last_signal_text[pair_name] = extracted_payload
-    else:
-      print(f"[{pair_name}] Duplicate/No update.")
+        if formatted_signal and formatted_signal != last_signal_text[pair_name]:
+          msg = (
+              "🚨 *ACCURATE TRADEBISE SIGNAL DETECTED* 🚨\n\n"
+              f"📌 *Asset:* `{pair_name}`\n"
+              f"⏰ *Time:* `{current_time} PKT`\n\n"
+              "📊 *Signal & Analysis Details:*\n"
+              "-----------------------------------\n"
+              f"{formatted_signal}\n"
+              "-----------------------------------\n\n"
+              f"🔗 [Direct Chart Link]({url})"
+          )
+          send_telegram_alert(msg)
+          last_signal_text[pair_name] = formatted_signal
+
+      except Exception as inner_e:
+        print(f"Error processing {pair_name}: {inner_e}")
 
   except Exception as e:
-    print(f"Scraper error for {pair_name}: {e}")
+    print(f"Driver initialization failed: {e}")
+  finally:
+    if driver:
+      driver.quit()
 
 
-def run_monitoring_cycle():
-  for pair_name, url in PAIRS_URLS.items():
-    fetch_and_parse_signal(pair_name, url)
-    time.sleep(3)
-
-
+# ==================== DUMMY WEBSERVER ====================
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
 
   def do_GET(self):
     self.send_response(200)
     self.end_headers()
-    self.wfile.write(b"Tradebise Monitor Active")
+    self.wfile.write(b"Tradebise 90s Delay Scraper Active")
 
 
 def run_dummy_server():
@@ -140,13 +150,12 @@ if __name__ == "__main__":
   threading.Thread(target=run_dummy_server, daemon=True).start()
 
   send_telegram_alert(
-      "🚀 *Tradebise Filtered Monitor Fixed & Active!*\n\nAb 'Search market'"
-      " jaise kachra messages nahi aayenge."
+      "🚀 *Tradebise Bot Updated!*\nNow waiting full 90 seconds on page for"
+      " chart & signal processing."
   )
 
   while True:
-    check_daily_good_morning()
-    run_monitoring_cycle()
+    fetch_and_parse_signal()
     sys.stdout.flush()
     time.sleep(300)
-                           
+      
